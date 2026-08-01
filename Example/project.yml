@@ -1,0 +1,32 @@
+# Example app only. It consumes the library the same way you will: as a local
+# Swift package sitting one directory up.
+name: LiquidGlassExample
+options:
+  bundleIdPrefix: com.liquidglass
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+packages:
+  LiquidGlass:
+    path: ../
+
+targets:
+  LiquidGlassExample:
+    type: application
+    platform: iOS
+    sources:
+      - path: .
+        excludes: ["project.yml"]
+    dependencies:
+      - package: LiquidGlass
+        product: LiquidGlass
+    settings:
+      base:
+        PRODUCT_NAME: LiquidGlassExample
+        PRODUCT_BUNDLE_IDENTIFIER: com.liquidglass.example
+        INFOPLIST_FILE: Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
