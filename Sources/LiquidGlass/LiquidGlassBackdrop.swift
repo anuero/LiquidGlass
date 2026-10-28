@@ -57,7 +57,11 @@ public final class LiquidGlassBackdrop {
 
     /// Re-capture every frame. Turn off for a static backdrop and call
     /// `setNeedsCapture()` yourself.
-    public var isLive: Bool = true
+    /// on by default, and it is the biggest cost: the main thread re-rasterizes the source every
+    /// frame even at rest. with it off an idle screen costs nothing, the engine sleeps
+    public var isLive: Bool = true {
+        didSet { if isLive && !oldValue { LiquidGlassEngine.shared?.wake() } }
+    }
 
     /// Region of `sourceView` to capture, in its coordinates.
     ///
@@ -83,7 +87,7 @@ public final class LiquidGlassBackdrop {
             teardownCompositedView()
             samples.removeAll()
             sampleCursor = 0
-            needsCapture = true
+            setNeedsCapture()
         }
     }
 
@@ -137,13 +141,18 @@ public final class LiquidGlassBackdrop {
 
     deinit { compositedView?.removeFromSuperview() }
 
-    public func setNeedsCapture() { needsCapture = true }
+    public func setNeedsCapture() {
+        needsCapture = true
+        LiquidGlassEngine.shared?.wake()
+    }
+
+    var wantsCapture: Bool { needsCapture || isLive }
 
     func invalidateTextures() {
         slots.removeAll()
         pyramid = nil
         pyramidLevelViews.removeAll()
-        needsCapture = true
+        setNeedsCapture()
     }
 
     var sharpTexture: MTLTexture? { slots.isEmpty ? nil : slots[slotIndex].texture }
@@ -160,7 +169,8 @@ public final class LiquidGlassBackdrop {
         let rect = captureRect ?? autoCaptureRect(in: source)
         guard rect.width > 0, rect.height > 0 else { return false }
 
-        let scale = max(0.25, min(captureScale, 1.0)) * UIScreen.main.scale
+        let screenScale = source.window?.screen.scale ?? UIScreen.main.scale
+        let scale = max(0.25, min(captureScale, 1.0)) * screenScale
         // Reallocate on a size change only: a glass view being dragged moves the
         // rect every frame, and rebuilding the pyramid for that would cost far
         // more than the capture itself.

@@ -10,14 +10,42 @@ public struct LiquidGlassShape: Equatable {
     public var rect: CGRect
     /// Negative means "capsule".
     public var cornerRadius: CGFloat
+    /// nil wears the view's `configuration.tint`
+    public var tint: UIColor?
 
-    public init(rect: CGRect, cornerRadius: CGFloat = -1) {
+    public init(rect: CGRect, cornerRadius: CGFloat = -1, tint: UIColor? = nil) {
         self.rect = rect
         self.cornerRadius = cornerRadius
+        self.tint = tint
     }
 
     func resolvedRadius() -> CGFloat {
         cornerRadius < 0 ? min(rect.width, rect.height) / 2 : cornerRadius
+    }
+}
+
+/// how `setShapes(_:animated:)` moves
+public struct LiquidGlassMorph: Equatable {
+    public var stiffness: CGFloat
+    public var dampingRatio: CGFloat
+    /// peak merge radius in points, how thick the neck between shapes gets
+    public var bulge: CGFloat
+    /// peak scale of the swell, 1 turns it off
+    public var pulse: CGFloat
+    /// recoil from the partner, as a fraction of the distance between centres, 0 turns it off
+    public var kick: CGFloat
+    /// 5 plays it five times slower
+    public var timeScale: CGFloat
+
+    public init(stiffness: CGFloat = pow(2 * CGFloat.pi / 0.416, 2), dampingRatio: CGFloat = 0.75,
+                bulge: CGFloat = 20, pulse: CGFloat = 1.2, kick: CGFloat = 1.0 / 6.0,
+                timeScale: CGFloat = 1) {
+        self.stiffness = stiffness
+        self.dampingRatio = dampingRatio
+        self.bulge = bulge
+        self.pulse = pulse
+        self.kick = kick
+        self.timeScale = timeScale
     }
 }
 
@@ -54,8 +82,79 @@ public final class LiquidGlassView: UIView {
     }
 
     /// Override the rendered geometry. `nil` renders the view's own bounds.
+    /// setting it jumps, and cancels a running `setShapes(_:animated:)`
     public var shapes: [LiquidGlassShape]? {
-        didSet { applyShadow(); setNeedsGlassRedraw() }
+        didSet {
+            activeMorph = nil
+            applyShadow()
+            setNeedsGlassRedraw()
+        }
+    }
+
+    /// most shapes one view draws, trail droplets included
+    public static let maxShapeCount = 12
+
+    public var morph = LiquidGlassMorph()
+
+    /// matched by index. jumps instead with a different count, no window, or reduce motion
+    public func setShapes(_ newShapes: [LiquidGlassShape], animated: Bool) {
+        let from = resolvedShapes()
+        let canAnimate = animated
+            && !UIAccessibility.isReduceMotionEnabled
+            && window != nil
+            && !newShapes.isEmpty
+            && from.count == newShapes.count
+        shapes = newShapes
+        guard canAnimate else { return }
+        activeMorph = MorphState(from: from, to: newShapes, bounds: bounds, morph: morph)
+        setNeedsGlassRedraw()
+    }
+    private var activeMorph: MorphState?
+
+    /// the shapes as drawn right now, lay icons over these
+    public var displayedShapes: [LiquidGlassShape] { resolvedShapes() }
+
+    /// shrink times pulse of each displayed shape, 1 at rest
+    public var displayedScales: [CGSize] {
+        activeMorph?.scales ?? Array(repeating: CGSize(width: 1, height: 1), count: resolvedShapes().count)
+    }
+
+    /// after every morph step, with the seconds of animation time it covered
+    public var onMorphStep: ((CGFloat) -> Void)?
+
+    /// 0 at the start of a morph, 1 once settled
+    public var morphProgress: CGFloat { activeMorph?.progress ?? 1 }
+
+    var isMorphing: Bool { activeMorph != nil }
+
+    var morphNeck: CGFloat { activeMorph?.neck ?? 0 }
+
+    var needsGlassRedraw: Bool { needsRedraw }
+
+    // tests flip this, the system setting can't be changed from a test
+    var reduceTransparencyOverride: Bool?
+
+    // one grey for the whole view, by appearance
+    private var solidPlate: Float {
+        guard reduceTransparencyOverride ?? UIAccessibility.isReduceTransparencyEnabled else { return 0 }
+        return traitCollection.userInterfaceStyle == .dark ? 0.17 : 0.95
+    }
+
+    // the old callback is the one that works on every version this package supports
+    @available(iOS, deprecated: 17.0, message: "Superseded by registerForTraitChanges")
+    public override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        if previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle {
+            setNeedsGlassRedraw()
+        }
+    }
+
+    // both for LiquidGlassBaker
+    var rendersRimOverlayOnly = false
+    var renderScaleOverride: CGFloat?
+
+    public override var isHidden: Bool {
+        didSet { if isHidden != oldValue { setNeedsGlassRedraw() } }
     }
 
     /// How far the glass lags behind a moving shape, as a fraction of the spring's
@@ -135,6 +234,14 @@ public final class LiquidGlassView: UIView {
         metalLayer.framebufferOnly = true
         applyShadow()
         updateFallback()
+        // selector based, so it goes with the view
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(accessibilityDidChange),
+            name: UIAccessibility.reduceTransparencyStatusDidChangeNotification, object: nil)
+    }
+
+    @objc private func accessibilityDidChange() {
+        setNeedsGlassRedraw()
     }
 
     public override func didMoveToWindow() {
@@ -150,7 +257,7 @@ public final class LiquidGlassView: UIView {
 
     public override func layoutSubviews() {
         super.layoutSubviews()
-        let scale = window?.screen.scale ?? UIScreen.main.scale
+        let scale = renderScaleOverride ?? window?.screen.scale ?? UIScreen.main.scale
         metalLayer.contentsScale = scale
         let size = CGSize(width: max(1, bounds.width * scale), height: max(1, bounds.height * scale))
         if metalLayer.drawableSize != size { metalLayer.drawableSize = size }
@@ -159,13 +266,22 @@ public final class LiquidGlassView: UIView {
         setNeedsGlassRedraw()
     }
 
-    public func setNeedsGlassRedraw() { needsRedraw = true }
+    public func setNeedsGlassRedraw() {
+        needsRedraw = true
+        LiquidGlassEngine.shared?.wake()
+    }
 
     // MARK: Shape
 
     private func resolvedShapes() -> [LiquidGlassShape] {
-        if let shapes = shapes, !shapes.isEmpty { return shapes }
-        return [LiquidGlassShape(rect: bounds, cornerRadius: cornerRadius)]
+        let target: [LiquidGlassShape]
+        if let shapes = shapes, !shapes.isEmpty {
+            target = shapes
+        } else {
+            target = [LiquidGlassShape(rect: bounds, cornerRadius: cornerRadius)]
+        }
+        guard let active = activeMorph, active.to.count == target.count else { return target }
+        return active.shapes
     }
 
     private func shapePath() -> UIBezierPath {
@@ -181,9 +297,14 @@ public final class LiquidGlassView: UIView {
         shapePath().contains(point)
     }
 
-    private func applyShadow() {
+    private func updateShadowPath() {
         guard bounds.width > 0, bounds.height > 0 else { return }
         layer.shadowPath = shapePath().cgPath
+    }
+
+    private func applyShadow() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        updateShadowPath()
         layer.shadowOpacity = Float(configuration.shadowOpacity)
         layer.shadowRadius = configuration.shadowRadius
         layer.shadowOffset = configuration.shadowOffset
@@ -213,8 +334,19 @@ public final class LiquidGlassView: UIView {
     /// Springs on the elastic deformations, stepped by the engine.
     func stepAnimation(duration: CFTimeInterval) {
         let dt = CGFloat(min(max(duration, 1.0 / 240.0), 1.0 / 30.0))
+        stepMorph(dt)
         stepTrail(dt)
         stepPull(dt)
+    }
+
+    private func stepMorph(_ frameTime: CGFloat) {
+        guard var active = activeMorph else { return }
+        let dt = frameTime / max(0.05, morph.timeScale)
+        active.step(dt)
+        activeMorph = active.isSettled ? nil : active
+        needsRedraw = true
+        updateShadowPath()
+        onMorphStep?(dt)
     }
 
     /// Lags the finger while pulling, springs back to the grab point on release.
@@ -333,7 +465,8 @@ public final class LiquidGlassView: UIView {
         // into a longer bar, with no corner-shape discontinuity the moment the
         // stretch starts. Anything with an explicit radius keeps it.
         result[index] = LiquidGlassShape(rect: rect,
-                                         cornerRadius: home.cornerRadius < 0 ? -1 : home.resolvedRadius())
+                                         cornerRadius: home.cornerRadius < 0 ? -1 : home.resolvedRadius(),
+                                         tint: home.tint)
         return result
     }
 
@@ -410,7 +543,8 @@ public final class LiquidGlassView: UIView {
                 rect: CGRect(x: center.x + lag.dx - size.width / 2,
                              y: center.y + lag.dy - size.height / 2,
                              width: size.width, height: size.height),
-                cornerRadius: shape.cornerRadius < 0 ? -1 : shape.cornerRadius * taper))
+                cornerRadius: shape.cornerRadius < 0 ? -1 : shape.cornerRadius * taper,
+                tint: shape.tint))
             merge = max(merge, bridging(gap: distance / 2))
         }
         return (trails, merge)
@@ -470,12 +604,17 @@ public final class LiquidGlassView: UIView {
         uniforms.innerShadow = Float(configuration.innerShadow)
         uniforms.mergeRadius = Float(configuration.mergeRadius) * scale
         uniforms.blurLOD = backdrop.lod(forBlurRadius: configuration.blurRadius)
+        uniforms.solid = solidPlate
+        uniforms.overlay = rendersRimOverlayOnly ? 1 : 0
 
-        if let tint = configuration.tint {
+        // a shape without its own tint wears the view's
+        func packedTint(_ color: UIColor?) -> SIMD4<Float> {
+            guard let color = color else { return SIMD4(0, 0, 0, 0) }
             var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
-            tint.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
-            uniforms.tint = SIMD4(Float(red), Float(green), Float(blue), Float(alpha))
+            color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+            return SIMD4(Float(red), Float(green), Float(blue), Float(alpha))
         }
+        uniforms.tint = packedTint(configuration.tint)
 
         // Leaders first, then their trailing droplets, so the 12-shape budget
         // never drops a real shape in favour of a trail.
@@ -487,12 +626,14 @@ public final class LiquidGlassView: UIView {
         let (extras, required) = trailShapes(for: base)
         let leaders = stretched(base)
         applyContentOffset()
-        let emitted = Array((leaders + extras).prefix(12))
+        let emitted = Array((leaders + extras).prefix(Self.maxShapeCount))
 
         // Deformation is only liquid if it bridges, but only by as much as the
         // current gap needs, so the radius decays to nothing along with the
         // droplet instead of stepping when it is dropped.
         uniforms.mergeRadius = max(uniforms.mergeRadius, Float(required) * scale)
+        // zero at both ends, so nothing stays merged or inflated once it lands
+        uniforms.mergeRadius = max(uniforms.mergeRadius, Float(morphNeck) * scale)
 
         var shapes = emitted.enumerated().map { index, shape -> LGShape in
             var packed = LGShape()
@@ -507,6 +648,7 @@ public final class LiquidGlassView: UIView {
             // rendering as.
             let isCapsule = shape.resolvedRadius() >= min(shape.rect.width, shape.rect.height) / 2 - 0.5
             packed.cornerExponent = isCapsule ? 2 : Float(configuration.cornerExponent)
+            packed.tint = shape.tint.map { packedTint($0) } ?? uniforms.tint
             return packed
         }
         uniforms.shapeCount = Float(shapes.count)

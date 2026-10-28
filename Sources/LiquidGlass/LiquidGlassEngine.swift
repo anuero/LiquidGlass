@@ -32,8 +32,11 @@ public final class LiquidGlassEngine {
     private struct Weak { weak var view: LiquidGlassView? }
 
     private init?() {
-        assert(MemoryLayout<LGUniforms>.stride == 128, "LGUniforms drifted from Shaders.metal")
-        assert(MemoryLayout<LGShape>.stride == 32, "LGShape drifted from Shaders.metal")
+        // release builds too: a drifted layout would draw garbage, this sends views to the blur fallback
+        guard MemoryLayout<LGUniforms>.stride == 128, MemoryLayout<LGShape>.stride == 48 else {
+            assertionFailure("LGUniforms / LGShape drifted from Shaders.metal")
+            return nil
+        }
 
         // Swift Package Manager compiles the .metal file into the package's own
         // resource bundle; built straight into an app it lands in the default one.
@@ -96,8 +99,18 @@ public final class LiquidGlassEngine {
         if views.isEmpty { stop() }
     }
 
+    // anything that gives the engine work calls this, so a paused link never holds stale glass
+    func wake() {
+        displayLink?.isPaused = false
+    }
+
+    var isAsleep: Bool { displayLink?.isPaused ?? true }
+
     private func startIfNeeded() {
-        guard displayLink == nil else { return }
+        if let displayLink = displayLink {
+            displayLink.isPaused = false
+            return
+        }
         let link = CADisplayLink(target: self, selector: #selector(tick))
         link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 120)
         link.add(to: .main, forMode: .common)
@@ -127,6 +140,17 @@ public final class LiquidGlassEngine {
             for view in live { view.setNeedsGlassRedraw() }
         }
         for view in live { view.stepAnimation(duration: link.duration) }
+
+        // nothing dirty and nothing live: no command buffer. the link sleeps too, unless
+        // a view follows the gyroscope. a dirty view takes the full path, which is also
+        // where a changed capture area is noticed
+        if !live.contains(where: { $0.needsGlassRedraw || ($0.backdrop?.wantsCapture ?? false) }) {
+            inFlight.signal()
+            let followsMotion = motion.isDeviceMotionAvailable
+                && live.contains { $0.configuration.motionResponsive }
+            if !followsMotion { link.isPaused = true }
+            return
+        }
 
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             inFlight.signal()

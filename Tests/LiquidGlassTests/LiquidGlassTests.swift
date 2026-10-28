@@ -14,7 +14,9 @@ final class LiquidGlassTests: XCTestCase {
     /// every scalar sits at its natural offset. Pin it.
     func testUniformLayoutMatchesShader() {
         XCTAssertEqual(MemoryLayout<LGUniforms>.stride, 128)
-        XCTAssertEqual(MemoryLayout<LGShape>.stride, 32)
+        XCTAssertEqual(MemoryLayout<LGShape>.stride, 48)
+        // a float4, so it starts on a 16-byte boundary
+        XCTAssertEqual(MemoryLayout<LGShape>.offset(of: \.tint), 32)
     }
 
     /// With refraction, frost, tint, saturation and light all neutralized, the
@@ -241,6 +243,500 @@ final class LiquidGlassTests: XCTestCase {
         for _ in 0..<300 { glass.stepAnimation(duration: 1.0 / 60) }
         try render()
         XCTAssertEqual(glyph.transform, .identity, "it must come all the way back")
+    }
+
+    // MARK: Per-shape tint
+
+    // a view-wide tint can't pass this, one colour would cover both
+    func testEachShapeWearsItsOwnTintAndOneWithoutWearsTheViews() throws {
+        let (engine, glass, backdrop, window) = try makeFixture()
+        defer { window.isHidden = true }
+        var configuration = glass.configuration
+        configuration.tint = UIColor(red: 0, green: 1, blue: 0, alpha: 1)    // the view's: green
+        glass.configuration = configuration
+        glass.shapes = [
+            LiquidGlassShape(rect: CGRect(x: 0, y: 40, width: 50, height: 40)),            // no tint: green
+            LiquidGlassShape(rect: CGRect(x: 70, y: 40, width: 50, height: 40),
+                             tint: UIColor(red: 1, green: 0, blue: 0, alpha: 1)),          // red
+        ]
+        glass.layoutIfNeeded()
+        let scale = glass.layer.contentsScale
+        let target = try makeTarget(engine: engine, width: Int(glass.bounds.width * scale),
+                                    height: Int(glass.bounds.height * scale))
+        try render(engine: engine, glass: glass, backdrop: backdrop, target: target)
+
+        let left = readPixel(target, x: Int(25 * scale), y: Int(60 * scale))
+        XCTAssertEqual(Int(left.green), 255, accuracy: 6, "a shape with no tint wears the view's")
+        XCTAssertEqual(Int(left.red), 0, accuracy: 6, "and none of its neighbour's")
+        let right = readPixel(target, x: Int(95 * scale), y: Int(60 * scale))
+        XCTAssertEqual(Int(right.red), 255, accuracy: 6, "a shape's own tint wins over the view's")
+        XCTAssertEqual(Int(right.green), 0, accuracy: 6)
+    }
+
+    // merged, the tints blend across the neck and the ends keep their own
+    func testTintsBlendAcrossTheNeckOfMergedShapes() throws {
+        let (engine, glass, backdrop, window) = try makeFixture()
+        defer { window.isHidden = true }
+        var configuration = glass.configuration
+        configuration.mergeRadius = 120
+        glass.configuration = configuration
+        glass.shapes = [
+            LiquidGlassShape(rect: CGRect(x: 0, y: 40, width: 40, height: 40),
+                             tint: UIColor(red: 0, green: 0, blue: 1, alpha: 1)),
+            LiquidGlassShape(rect: CGRect(x: 80, y: 40, width: 40, height: 40),
+                             tint: UIColor(red: 1, green: 0, blue: 0, alpha: 1)),
+        ]
+        glass.layoutIfNeeded()
+        let scale = glass.layer.contentsScale
+        let target = try makeTarget(engine: engine, width: Int(glass.bounds.width * scale),
+                                    height: Int(glass.bounds.height * scale))
+        try render(engine: engine, glass: glass, backdrop: backdrop, target: target)
+
+        let middle = readPixel(target, x: Int(60 * scale), y: Int(60 * scale))
+        XCTAssertGreaterThan(Int(middle.red), 40, "the neck carries some of the right shape's colour")
+        XCTAssertGreaterThan(Int(middle.blue), 40, "and some of the left shape's")
+        XCTAssertLessThan(Int(middle.red), 215, "without either one taking it over")
+        XCTAssertLessThan(Int(middle.blue), 215)
+    }
+
+    // MARK: Reduce Transparency
+
+    // probed over red and over white, the two ends of the brightness range
+    func testReduceTransparencyDrawsAnOpaquePlateThatIgnoresTheBackdrop() throws {
+        let (engine, glass, backdrop, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let scale = glass.layer.contentsScale
+
+        func probe(solid: Bool) throws -> (top: (blue: UInt8, green: UInt8, red: UInt8, alpha: UInt8),
+                                           bottom: (blue: UInt8, green: UInt8, red: UInt8, alpha: UInt8)) {
+            glass.reduceTransparencyOverride = solid
+            let target = try makeTarget(engine: engine, width: Int(glass.bounds.width * scale),
+                                        height: Int(glass.bounds.height * scale))
+            try render(engine: engine, glass: glass, backdrop: backdrop, target: target)
+            return (readPixel(target, x: Int(30 * scale), y: Int(30 * scale)),     // over red
+                    readPixel(target, x: Int(90 * scale), y: Int(90 * scale)))     // over white
+        }
+
+        let clear = try probe(solid: false)
+        XCTAssertEqual(Int(clear.top.green), 0, accuracy: 4, "transparent: red over red")
+        XCTAssertEqual(Int(clear.bottom.green), 255, accuracy: 4, "transparent: white over white")
+
+        let plate = try probe(solid: true)
+        XCTAssertEqual(plate.top.alpha, 255, "the plate is opaque")
+        XCTAssertEqual(plate.bottom.alpha, 255)
+        // one grey for the whole view, a plate that followed the backdrop would differ
+        XCTAssertEqual(Int(plate.top.red), Int(plate.bottom.red), accuracy: 2)
+        XCTAssertEqual(Int(plate.top.green), Int(plate.bottom.green), accuracy: 2)
+        XCTAssertEqual(Int(plate.top.blue), Int(plate.bottom.blue), accuracy: 2)
+        XCTAssertEqual(Int(plate.top.red), Int(plate.top.blue), accuracy: 2, "and it is a grey, not the backdrop's red")
+    }
+
+    func testReduceTransparencyPlateFollowsTheAppearance() throws {
+        let (engine, glass, backdrop, window) = try makeFixture()
+        defer { window.isHidden = true }
+        glass.reduceTransparencyOverride = true
+        let scale = glass.layer.contentsScale
+
+        func plateRed(_ style: UIUserInterfaceStyle) throws -> Int {
+            glass.overrideUserInterfaceStyle = style
+            // uikit applies the style on its next pass, not on assignment
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            let target = try makeTarget(engine: engine, width: Int(glass.bounds.width * scale),
+                                        height: Int(glass.bounds.height * scale))
+            try render(engine: engine, glass: glass, backdrop: backdrop, target: target)
+            return Int(readPixel(target, x: Int(60 * scale), y: Int(60 * scale)).red)
+        }
+
+        XCTAssertLessThan(try plateRed(.dark), 70, "a dark plate in dark mode")
+        XCTAssertGreaterThan(try plateRed(.light), 200, "a light plate in light mode")
+    }
+
+    // MARK: Animated shapes
+
+    // starts where the shapes are, lands exactly, leaves no neck behind
+    func testSetShapesMorphsOnASpringAndLandsExactlyWithNoNeckLeft() throws {
+        let (engine, glass, backdrop, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let start = [LiquidGlassShape(rect: CGRect(x: 0, y: 40, width: 40, height: 40)),
+                     LiquidGlassShape(rect: CGRect(x: 80, y: 40, width: 40, height: 40))]
+        let end = [LiquidGlassShape(rect: CGRect(x: 0, y: 40, width: 40, height: 40)),
+                   LiquidGlassShape(rect: CGRect(x: 50, y: 40, width: 40, height: 40))]
+        glass.shapes = start
+        glass.setShapes(end, animated: true)
+
+        XCTAssertTrue(glass.isMorphing)
+        XCTAssertEqual(glass.displayedShapes, start, "it starts exactly where the shapes are")
+        XCTAssertEqual(glass.morphNeck, 0, "no neck before it moves")
+
+        for _ in 0..<6 { glass.stepAnimation(duration: 1.0 / 60) }
+        let middle = glass.displayedShapes[1].rect.minX
+        XCTAssertGreaterThan(middle, 50, "it has left its start")
+        XCTAssertLessThan(middle, 80, "and is not there yet")
+        XCTAssertGreaterThan(glass.morphNeck, 5, "a neck bridges the shapes on the way")
+
+        for _ in 0..<600 { glass.stepAnimation(duration: 1.0 / 60) }
+        XCTAssertFalse(glass.isMorphing, "it settles")
+        XCTAssertEqual(glass.displayedShapes, end, "and lands exactly on the target")
+        XCTAssertEqual(glass.morphNeck, 0, "with no neck left")
+
+        // drawn, the 10pt gap between the landed shapes is empty
+        glass.layoutIfNeeded()
+        let scale = glass.layer.contentsScale
+        let target = try makeTarget(engine: engine, width: Int(glass.bounds.width * scale),
+                                    height: Int(glass.bounds.height * scale))
+        try render(engine: engine, glass: glass, backdrop: backdrop, target: target)
+        XCTAssertEqual(readPixel(target, x: Int(45 * scale), y: Int(60 * scale)).alpha, 0,
+                       "shapes that ended apart stay apart")
+        XCTAssertEqual(readPixel(target, x: Int(20 * scale), y: Int(60 * scale)).alpha, 255)
+        XCTAssertEqual(readPixel(target, x: Int(70 * scale), y: Int(60 * scale)).alpha, 255)
+    }
+
+    // MARK: Pulse
+
+    // a still shape on the left, one on the right travelling toward it (80 -> 50)
+    private func pulseShapes() -> (start: [LiquidGlassShape], end: [LiquidGlassShape]) {
+        let still = LiquidGlassShape(rect: CGRect(x: 0, y: 40, width: 40, height: 40))
+        return ([still, LiquidGlassShape(rect: CGRect(x: 80, y: 40, width: 40, height: 40))],
+                [still, LiquidGlassShape(rect: CGRect(x: 50, y: 40, width: 40, height: 40))])
+    }
+
+    private func trajectory(_ glass: LiquidGlassView, pulse: CGFloat, frames: Int = 240)
+        -> (moving: [CGRect], still: [CGRect]) {
+        let (start, end) = pulseShapes()
+        glass.morph.pulse = pulse
+        glass.shapes = start
+        glass.setShapes(end, animated: true)
+        var moving: [CGRect] = [], still: [CGRect] = []
+        for _ in 0..<frames {
+            glass.stepAnimation(duration: 1.0 / 60)
+            moving.append(glass.displayedShapes[1].rect)
+            still.append(glass.displayedShapes[0].rect)
+        }
+        return (moving, still)
+    }
+
+    func testPulseSwellsOnlyTheShapeThatChangesAndLandsExactly() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let (start, end) = pulseShapes()
+
+        let plain = trajectory(glass, pulse: 1)
+        XCTAssertEqual(plain.moving.map { $0.height }.max(), 40, "pulse off: the height never changes")
+
+        let pulsed = trajectory(glass, pulse: 1.2)
+        let peak = try XCTUnwrap(pulsed.moving.map { $0.height }.max())
+        XCTAssertGreaterThan(peak, 44, "the shape that moves swells at the peak of its pulse (1.2 x 40 = 48)")
+        XCTAssertLessThan(peak, 56, "but only by the pulse's cap, not without bound")
+        XCTAssertTrue(pulsed.still.allSatisfy { $0 == start[0].rect },
+                      "a shape that does not change does not pulse, whatever its neighbour does")
+
+        XCTAssertFalse(glass.isMorphing, "the pulse settles too")
+        XCTAssertEqual(glass.displayedShapes, end, "and nothing of it is left on the shapes")
+    }
+
+    func testShapeWithNoPartnerPulsesAboutItsCentre() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let plain = trajectory(glass, pulse: 1)
+        let pulsed = trajectory(glass, pulse: 1.2)
+
+        var swelled = false
+        for (a, b) in zip(plain.moving, pulsed.moving) {
+            XCTAssertEqual(b.midX, a.midX, accuracy: 0.001, "the centre does not move")
+            XCTAssertEqual(b.midY, a.midY, accuracy: 0.001)
+            if b.width > a.width + 2 { swelled = true }
+        }
+        XCTAssertTrue(swelled, "and it clearly swells at some point")
+    }
+
+    // MARK: Merging pills
+
+    // a still shape on the right and one that goes into it, or comes out of it
+    private func mergingShapes(collapsing: Bool) -> (start: [LiquidGlassShape], end: [LiquidGlassShape]) {
+        let partner = LiquidGlassShape(rect: CGRect(x: 70, y: 40, width: 50, height: 40))
+        let apart = LiquidGlassShape(rect: CGRect(x: 0, y: 40, width: 40, height: 40))
+        let inside = LiquidGlassShape(rect: CGRect(x: 75, y: 40, width: 40, height: 40))
+        return collapsing ? ([apart, partner], [inside, partner]) : ([inside, partner], [apart, partner])
+    }
+
+    private func frames(_ glass: LiquidGlassView, _ shapes: (start: [LiquidGlassShape], end: [LiquidGlassShape]),
+                        pulse: CGFloat = 1.2, kick: CGFloat = 1.0 / 6.0, count: Int = 240) -> [[CGRect]] {
+        glass.morph.pulse = pulse
+        glass.morph.kick = kick
+        glass.shapes = shapes.start
+        glass.setShapes(shapes.end, animated: true)
+        var result: [[CGRect]] = []
+        for _ in 0..<count {
+            glass.stepAnimation(duration: 1.0 / 60)
+            result.append(glass.displayedShapes.map { $0.rect })
+        }
+        return result
+    }
+
+    func testShapeMovingIntoAnotherWaitsAndItsPartnerSwellsAtOnce() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let shapes = mergingShapes(collapsing: true)
+        let run = frames(glass, shapes)
+
+        // 0.083 s is five frames at 60 fps
+        for frame in 0..<4 {
+            XCTAssertEqual(run[frame][0], shapes.start[0].rect, "frame \(frame): the mover is still waiting")
+        }
+        XCTAssertNotEqual(run[6][0], shapes.start[0].rect, "and then it goes")
+        // the partner never moves, yet it swells from the first frames
+        XCTAssertNotEqual(run[3][1], shapes.end[1].rect, "the partner is already swelling while the mover waits")
+        XCTAssertEqual(run[239][0], shapes.end[0].rect, "both land exactly")
+        XCTAssertEqual(run[239][1], shapes.end[1].rect)
+    }
+
+    func testPartnerSwellsAboutTheSideItSitsOn() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let shapes = mergingShapes(collapsing: true)
+        let run = frames(glass, shapes)
+        let rest = shapes.end[1].rect
+
+        var stretchedInward = false
+        for frame in run {
+            let partner = frame[1]
+            XCTAssertEqual(partner.maxX, rest.maxX, accuracy: 0.001, "the trailing edge stays")
+            XCTAssertEqual(rest.minY - partner.minY, partner.maxY - rest.maxY, accuracy: 0.001,
+                           "centred on the vertical axis: grows up and down alike")
+            if partner.minX < rest.minX - 2 { stretchedInward = true }
+        }
+        XCTAssertTrue(stretchedInward, "it stretches clearly toward the middle")
+    }
+
+    func testShapeMovingIntoAnotherRecoilsFirst() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let shapes = mergingShapes(collapsing: true)
+        let withKick = frames(glass, shapes)
+        let withoutKick = frames(glass, shapes, kick: 0)
+
+        // the mover heads right, the recoil holds it back to the left
+        let behind = zip(withKick, withoutKick).map { $0[0].minX - $1[0].minX }.min() ?? 0
+        XCTAssertLessThan(behind, -5, "the recoil holds it clearly back at its deepest")
+        XCTAssertEqual(withKick[239][0], withoutKick[239][0], "and leaves nothing behind")
+    }
+
+    func testShapeGrowingOutOfAnotherStartsAtOnceAndOvershootsOutward() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let shapes = mergingShapes(collapsing: false)
+        let withKick = frames(glass, shapes)
+        let withoutKick = frames(glass, shapes, kick: 0)
+        let target = shapes.end[0].rect.minX
+
+        XCTAssertNotEqual(withKick[0][0], shapes.start[0].rect, "it starts at once, with no wait")
+        let overshoot = target - (withKick.map { $0[0].minX }.min() ?? target)
+        let springOnly = target - (withoutKick.map { $0[0].minX }.min() ?? target)
+        XCTAssertGreaterThan(overshoot, springOnly + 4, "the recoil throws it clearly past its place")
+        XCTAssertEqual(withKick[239][0], shapes.end[0].rect, "and it comes back to rest exactly on it")
+    }
+
+    func testMatchedPillShrinksGoingInAndGrowsComingOut() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+
+        let into = mergingShapes(collapsing: true)
+        let goingIn = frames(glass, into)
+        let narrowest = goingIn.map { $0[0].width }.min() ?? 0
+        XCTAssertLessThan(narrowest, 14, "it gets much smaller than its own 40 pt on the way in (a fifth is 8-10)")
+        // at some point it sits small inside the partner's frame
+        let partner = into.end[1].rect
+        XCTAssertTrue(goingIn.contains { partner.contains($0[0]) && $0[0].width < 20 },
+                      "it ends up small inside the partner's frame")
+        XCTAssertEqual(goingIn[239][0], into.end[0].rect, "and what is left once settled is its own rect, exactly")
+
+        let out = mergingShapes(collapsing: false)
+        glass.morph.pulse = 1.2
+        glass.shapes = out.start
+        glass.setShapes(out.end, animated: true)
+        let atStart = glass.displayedShapes[0].rect
+        XCTAssertLessThan(atStart.width, 14, "it starts small, inside its partner")
+        XCTAssertTrue(out.end[1].rect.contains(atStart), "inside the partner's frame")
+        let growing = frames(glass, out)
+        XCTAssertEqual(growing[239][0], out.end[0].rect, "and grows to exactly its own rect")
+    }
+
+    func testTintFadesFromTheStartAndAChangeOfTintAloneDoesNotMove() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let accent = UIColor(red: 0.6, green: 0.4, blue: 1, alpha: 1)
+        var shapes = mergingShapes(collapsing: true)
+        let still = LiquidGlassShape(rect: CGRect(x: 0, y: 90, width: 30, height: 20))
+        shapes.start[1].tint = nil
+        shapes.end[0].tint = accent
+        shapes.end[1].tint = accent
+        shapes.start.append(still)
+        shapes.end.append(LiquidGlassShape(rect: still.rect, tint: accent))
+
+        glass.shapes = shapes.start
+        glass.setShapes(shapes.end, animated: true)
+        for _ in 0..<3 { glass.stepAnimation(duration: 1.0 / 60) }
+        var alpha: CGFloat = 0
+        glass.displayedShapes[0].tint?.getRed(nil, green: nil, blue: nil, alpha: &alpha)
+        XCTAssertEqual(glass.displayedShapes[0].rect, shapes.start[0].rect, "the mover is still waiting")
+        XCTAssertGreaterThan(alpha, 0.05, "yet its tint has begun to change")
+
+        for _ in 0..<240 { glass.stepAnimation(duration: 1.0 / 60) }
+        XCTAssertEqual(glass.displayedShapes, shapes.end)
+
+        // a tint change alone keeps the rect on every frame
+        glass.shapes = shapes.start
+        glass.setShapes(shapes.end, animated: true)
+        for _ in 0..<120 {
+            glass.stepAnimation(duration: 1.0 / 60)
+            XCTAssertEqual(glass.displayedShapes[2].rect, still.rect, "a change of tint is not a move")
+        }
+    }
+
+    func testWithPulseAndKickOffThePartnerStaysPutAndTheMoverWaitsNoLonger() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let shapes = mergingShapes(collapsing: true)
+        let run = frames(glass, shapes, pulse: 1, kick: 0)
+        XCTAssertTrue(run.allSatisfy { $0[1] == shapes.end[1].rect }, "no pulse: the partner never moves")
+    }
+
+    func testSetShapesJumpsWhenNotAnimatedOrWhenTheCountChanges() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let one = [LiquidGlassShape(rect: CGRect(x: 0, y: 0, width: 40, height: 40))]
+        let moved = [LiquidGlassShape(rect: CGRect(x: 50, y: 0, width: 40, height: 40))]
+        let two = moved + one
+        glass.shapes = one
+
+        glass.setShapes(moved, animated: false)
+        XCTAssertFalse(glass.isMorphing)
+        XCTAssertEqual(glass.displayedShapes, moved)
+
+        glass.setShapes(two, animated: true)
+        XCTAssertFalse(glass.isMorphing, "a different count cannot be matched by index")
+        XCTAssertEqual(glass.displayedShapes, two)
+    }
+
+    func testAssigningShapesDirectlyCancelsARunningMorph() throws {
+        let (_, glass, _, window) = try makeFixture()
+        defer { window.isHidden = true }
+        let a = [LiquidGlassShape(rect: CGRect(x: 0, y: 0, width: 40, height: 40))]
+        let b = [LiquidGlassShape(rect: CGRect(x: 60, y: 0, width: 40, height: 40))]
+        let c = [LiquidGlassShape(rect: CGRect(x: 0, y: 60, width: 40, height: 40))]
+        glass.shapes = a
+        glass.setShapes(b, animated: true)
+        glass.stepAnimation(duration: 1.0 / 60)
+        glass.shapes = c
+        XCTAssertFalse(glass.isMorphing)
+        for _ in 0..<60 { glass.stepAnimation(duration: 1.0 / 60) }
+        XCTAssertEqual(glass.displayedShapes, c)
+    }
+
+    // MARK: Engine idle
+
+    // a link that sleeps through a change would leave stale glass
+    func testEngineSleepsWhenThereIsNothingToDoAndAnyChangeWakesIt() throws {
+        let (engine, glass, backdrop, window) = try makeFixture()
+        defer { glass.removeFromSuperview(); window.isHidden = true }
+        func spin(_ seconds: TimeInterval) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
+
+        backdrop.isLive = false
+        spin(0.5)
+        XCTAssertTrue(engine.isAsleep, "nothing live, nothing dirty: it sleeps")
+
+        glass.setNeedsGlassRedraw()
+        XCTAssertFalse(engine.isAsleep, "a redraw request wakes it")
+        spin(0.5)
+        XCTAssertTrue(engine.isAsleep, "and it sleeps again once drawn")
+
+        backdrop.setNeedsCapture()
+        XCTAssertFalse(engine.isAsleep, "a capture request wakes it")
+        spin(0.5)
+        XCTAssertTrue(engine.isAsleep)
+
+        glass.isHidden = true
+        spin(0.2)
+        glass.isHidden = false
+        XCTAssertFalse(engine.isAsleep, "showing the view again wakes it")
+        spin(0.5)
+        XCTAssertTrue(engine.isAsleep)
+
+        backdrop.isLive = true
+        spin(0.4)
+        XCTAssertFalse(engine.isAsleep, "a live backdrop keeps it running")
+    }
+
+    // MARK: Baking
+
+    private struct Raster {
+        let width: Int, height: Int
+        let bytes: [UInt8]      // RGBA, premultiplied
+        func alpha(_ x: Int, _ y: Int) -> UInt8 { bytes[(y * width + x) * 4 + 3] }
+        func pixel(_ x: Int, _ y: Int) -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8) {
+            let i = (y * width + x) * 4
+            return (bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3])
+        }
+    }
+
+    private func raster(_ image: UIImage) throws -> Raster {
+        let cg = try XCTUnwrap(image.cgImage)
+        var bytes = [UInt8](repeating: 0, count: cg.width * cg.height * 4)
+        let context = try XCTUnwrap(CGContext(
+            data: &bytes, width: cg.width, height: cg.height, bitsPerComponent: 8, bytesPerRow: cg.width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+        return Raster(width: cg.width, height: cg.height, bytes: bytes)
+    }
+
+    // a layer that lit the whole body would wash out the frost under it
+    func testBakedRimIsLitOnTheRimAndHollowInsideAndOutside() throws {
+        let size = CGSize(width: 120, height: 44)
+        let image = try XCTUnwrap(LiquidGlassBaker.image(size: size, content: .rimOverlay, scale: 2))
+        XCTAssertEqual(image.size, size)
+        XCTAssertEqual(image.scale, 2)
+        let r = try raster(image)
+        XCTAssertEqual(r.width, 240)
+        XCTAssertEqual(r.height, 88)
+
+        XCTAssertEqual(r.alpha(0, 0), 0, "outside the capsule")
+        // deeper than the 14pt bevel reaches
+        var hollow = 0
+        for y in stride(from: 32, to: 56, by: 1) {                  // 16...28pt
+            for x in stride(from: 50, to: 190, by: 1) where r.alpha(x, y) > 6 { hollow += 1 }
+        }
+        XCTAssertEqual(hollow, 0, "the body must stay clear")
+
+        // the default light is upper left
+        var lit = 0
+        for x in 0..<120 { for y in 0..<44 where r.alpha(x, y) > 50 { lit += 1 } }
+        XCTAssertGreaterThan(lit, 10, "the rim facing the light must carry its highlight")
+    }
+
+    func testBakedGlassOverAFlatBackdropKeepsItsColour() throws {
+        var configuration = LiquidGlassConfiguration.regular
+        configuration.thickness = 0
+        configuration.frost = 0
+        configuration.chromaticAberration = 0
+        configuration.saturation = 1
+        configuration.adaptivity = 0
+        configuration.specular = 0
+        configuration.fresnel = 0
+        configuration.innerShadow = 0
+        let red = UIGraphicsImageRenderer(size: CGSize(width: 8, height: 8)).image { ctx in
+            UIColor.red.setFill(); ctx.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        }
+        let image = try XCTUnwrap(LiquidGlassBaker.image(
+            size: CGSize(width: 80, height: 40), configuration: configuration,
+            content: .glass(over: red), scale: 2))
+        let r = try raster(image)
+        let center = r.pixel(80, 40)
+        XCTAssertEqual(Int(center.r), 255, accuracy: 4)
+        XCTAssertEqual(Int(center.g), 0, accuracy: 4)
+        XCTAssertEqual(Int(center.b), 0, accuracy: 4)
+        XCTAssertEqual(center.a, 255)
+        XCTAssertEqual(r.alpha(0, 0), 0, "the corner of the capsule is outside it")
     }
 
     // MARK: Fixture

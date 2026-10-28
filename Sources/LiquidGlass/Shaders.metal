@@ -14,6 +14,7 @@ struct LGShape {
     float  cornerExponent;  // 2 = circular corners, ~4.2 = iOS continuous corners
     float  _pad0;
     float  _pad1;
+    float4 tint;            // rgb + strength
 };
 
 struct LGUniforms {
@@ -43,8 +44,8 @@ struct LGUniforms {
 
     float  mergeRadius;     // px, smooth-min between shapes ("liquid")
     float  blurLOD;         // mip level of the backdrop pyramid used for the frost
-    float  _pad1;
-    float  _pad2;
+    float  solid;           // > 0: reduce transparency, an opaque plate of this grey
+    float  overlay;         // 1: baked rim, only light and shade
 };
 
 constexpr sampler lgSampler(coord::normalized, address::clamp_to_edge,
@@ -114,6 +115,24 @@ static float sceneSDF(float2 p, constant LGUniforms &u, constant LGShape *shapes
     return d;
 }
 
+// every shape's tint weighted by how close the pixel is to it, so tints blend across a neck
+static float4 sceneTint(float2 p, constant LGUniforms &u, constant LGShape *shapes) {
+    int n = int(u.shapeCount);
+    float3 rgb = float3(0.0);
+    float strength = 0.0;
+    float weights = 0.0;
+    for (int i = 0; i < n; ++i) {
+        LGShape s = shapes[i];
+        float r = min(s.cornerRadius, min(s.halfSize.x, s.halfSize.y));
+        float di = sdRoundBox(p - s.center, s.halfSize, r, s.cornerExponent);
+        float w = exp(-max(di, 0.0) / (3.0 * u.scale));
+        rgb += s.tint.rgb * s.tint.a * w;
+        strength += s.tint.a * w;
+        weights += w;
+    }
+    return float4(rgb / max(strength, 1.0e-5), strength / max(weights, 1.0e-5));
+}
+
 // MARK: - Glass
 
 fragment float4 lg_glass(VOut in [[stage_in]],
@@ -127,6 +146,21 @@ fragment float4 lg_glass(VOut in [[stage_in]],
     // 1px analytic antialiasing straight off the SDF. No layer mask needed.
     float alpha = clamp(0.5 - d, 0.0, 1.0);
     if (alpha <= 0.001) return float4(0.0);
+
+    const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+    float2 originUV = u.backdropOrigin * u.backdropInvSize;
+    float2 uvScale  = u.backdropInvSize / u.scale;          // px -> normalized
+    float2 baseUV   = originUV + p * uvScale;
+
+    // one grey for every shape, with a hairline edge so it still reads
+    if (u.solid > 0.0) {
+        float3 plate = float3(u.solid);
+        float4 tintSolid = sceneTint(p, u, shapes);
+        plate = mix(plate, tintSolid.rgb, tintSolid.a);
+        float edge = 1.0 - clamp(-d / max(u.scale, 1.0), 0.0, 1.0);
+        plate = mix(plate, float3(1.0 - u.solid), 0.16 * edge);
+        return float4(plate * alpha, alpha);
+    }
 
     // Outward-pointing 2D gradient of the field.
     // central differences = 4 extra SDF evals/px. Fine for UI-sized
@@ -155,10 +189,6 @@ fragment float4 lg_glass(VOut in [[stage_in]],
     disp = clamp(disp, -u.thickness * 6.0, u.thickness * 6.0);
 
     // --- Backdrop sampling ------------------------------------------------
-    float2 originUV = u.backdropOrigin * u.backdropInvSize;
-    float2 uvScale  = u.backdropInvSize / u.scale;          // px -> normalized
-    float2 baseUV   = originUV + p * uvScale;
-
     float edgeW = 1.0 - x;                                   // aberration lives on the rim
     float ca    = u.chroma * edgeW;
     float3 sharp;
@@ -173,7 +203,6 @@ fragment float4 lg_glass(VOut in [[stage_in]],
     float3 col = mix(sharp, blurC, u.frost * smoothstep(0.0, 1.0, x));
 
     // --- Material ---------------------------------------------------------
-    const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
     col = mix(float3(dot(col, LUMA)), col, u.saturation);
 
     // Adaptive veil: glass goes light over bright content and dark over dark
@@ -184,7 +213,8 @@ fragment float4 lg_glass(VOut in [[stage_in]],
     float lightness = smoothstep(0.28, 0.78, bgL);
     float veilA     = mix(u.darkVeil, u.lightVeil, lightness) * u.adaptivity;
     col = mix(col, float3(lightness), veilA);
-    col = mix(col, u.tint.rgb, u.tint.a);
+    float4 tint = sceneTint(p, u, shapes);
+    col = mix(col, tint.rgb, tint.a);
 
     // --- Light ------------------------------------------------------------
     // The highlight is a thin arc hugging the edge, not a soft blob over the
@@ -203,10 +233,19 @@ fragment float4 lg_glass(VOut in [[stage_in]],
     float spec2 = pow(max(dot(N, H2), 0.0), u.shininess) * rimBand * 0.5;
 
     float fres = pow(1.0 - clamp(N.z, 0.0, 1.0), 6.0);
-    col += ((spec + spec2) * u.specular + fres * u.fresnel) * (1.0 - 0.35 * lightness);
+    float light = ((spec + spec2) * u.specular + fres * u.fresnel) * (1.0 - 0.35 * lightness);
 
     // Contact darkening on the rim facing away from the light.
     float shade = clamp(-dot(g, L.xy), 0.0, 1.0) * edgeW * u.innerShadow;
+
+    // light as white, shade as black, one premultiplied layer
+    if (u.overlay > 0.5) {
+        float lit = saturate(light);
+        float cover = lit + saturate(shade) * (1.0 - lit);
+        return float4(float3(lit) * alpha, cover * alpha);
+    }
+
+    col += light;
     col *= (1.0 - shade);
 
     return float4(saturate(col) * alpha, alpha);   // premultiplied

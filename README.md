@@ -92,7 +92,20 @@ custom.tint = UIColor.systemBlue.withAlphaComponent(0.12)
 bar.configuration = custom
 ```
 
-Static backdrop? Set `backdrop?.isLive = false` and call `setNeedsCapture()` when something changes. Per-frame cost goes to zero, and that capture is the whole cost of the material.
+**Read this before you ship: `isLive` defaults to `true`.** A live backdrop re-rasterizes the source view on the main thread every frame and redraws every glass view on it, even when nothing on screen moves. Static backdrop? Set `backdrop?.isLive = false` and call `setNeedsCapture()` when something changes (a scroll view's offset, a new image). An idle screen then costs nothing: with no live backdrop and nothing dirty, the engine stops creating command buffers and, when no view follows the gyroscope, puts its display link to sleep. Anything that gives it work wakes it again. That capture is the whole cost of the material.
+
+#### Tint per shape
+
+A `LiquidGlassShape` can carry its own tint. A shape without one wears `configuration.tint`.
+
+```swift
+bar.shapes = [
+    LiquidGlassShape(rect: search),
+    LiquidGlassShape(rect: done, tint: UIColor.systemPurple.withAlphaComponent(0.8)),
+]
+```
+
+Where two shapes merge, their tints blend across the neck.
 
 ## How the material is built
 
@@ -122,7 +135,61 @@ Both deform shapes *inside* the view, never the view itself. The drawable only c
 
 Reduce Motion forces both to 0, matching the system, which disables the elastic properties of the material there.
 
-There's deliberately no press-to-squeeze. Widening the bevel on touch reads as the control swelling, not as glass giving way.
+There's deliberately no press-to-squeeze. Widening the bevel on touch reads as the control swelling, not as glass giving way. The system's own interactive glass does swell under a finger and bounce back on release; that is UIKit's, and it is not reproduced here.
+
+## Animating between shapes
+
+`setShapes(_:animated:)` moves a view from one set of shapes to another, the way the system's glass moves when its pills merge. Shapes are matched by index, so the count has to stay the same.
+
+```swift
+glass.setShapes([qr, search, done], animated: true)
+```
+
+If a shape ends up inside another one without having started in it, it *goes into* it; if it starts inside one and ends outside, it *comes out of* it. That partner changes what happens:
+
+- Every shape that changes travels on its own spring (0.416 s response, 0.75 damping by default).
+- The partner starts at once. A pill that goes in waits 0.083 s; one that comes out starts at once.
+- The mover travels to the partner's frame (or out of it) and shrinks to a fifth of its size on the way, or grows from a fifth.
+- It first recoils from its partner by a sixth of the distance between their centres, then returns with a little bounce, so it winds up before it goes in and overshoots on the way out.
+- Both swell and spring back (the pulse): up to 1.2x per axis, capped at 16 pt of growth, height returning a little before width, about the side of the view the partner sits on. A shape that changes with no partner pulses about its centre.
+- Tints cross-fade on the shapes' spring from the very start.
+- A neck of glass bridges the shapes while they cross. Its radius is zero at both ends, so shapes that end apart stay apart and shapes that end on top of each other end as one shape, never inflated.
+
+Everything is in `LiquidGlassMorph` (`glass.morph`): `stiffness`, `dampingRatio`, `bulge` (neck thickness), `pulse` (1 turns it off), `kick` (0 turns it off) and `timeScale` (5 plays it five times slower, for tuning by eye). A pill that goes into another should end on top of it: when the move settles the view shows `shapes` exactly, so whatever it ends as must be hidden inside its partner.
+
+What you lay over the glass follows it frame for frame:
+
+```swift
+glass.onMorphStep = { dt in                    // seconds of animation time this step covered
+    let shapes = glass.displayedShapes         // as drawn right now: moved, recoiled, pulsed
+    let scales = glass.displayedScales         // the shrink and the pulse, to scale an icon by
+    // place your icons from these
+}
+```
+
+`morphProgress` is 0 at the start and 1 once settled. Setting `shapes` directly jumps and cancels a morph in flight. Under Reduce Motion, or with no window yet, `setShapes` jumps instead.
+
+The motion is modelled on how the system's glass behaves when pills merge in a navigation bar; the defaults were tuned to that, not measured against the system here. The `Example` is a single button and does not show it. A pill's contents (the icon that shrinks as it goes in, the label that grows to 1.2 and fades as it is swapped) are yours to animate. The same spring and the same clock (`onMorphStep`'s `dt`) are what they should run on.
+
+## Baking glass into an image
+
+A `LiquidGlassView` costs a backdrop capture and a Metal draw whenever it moves or its backdrop changes. Glass that does not need to be live, a capsule riding inside scrolling content over a wallpaper you control, can be rendered once into an image instead, which the compositor draws for free:
+
+```swift
+// The light on the rim, as a layer you put over your own frosted body.
+let rim = LiquidGlassBaker.image(size: CGSize(width: 96, height: 28), content: .rimOverlay)?
+    .resizableImage(withCapInsets: UIEdgeInsets(top: 0, left: 14, bottom: 0, right: 14),
+                    resizingMode: .stretch)
+
+// Or the whole glass over a picture.
+let glass = LiquidGlassBaker.image(size: size, content: .glass(over: wallpaper))
+```
+
+`.rimOverlay` is only the highlight arc, the Fresnel outline and the contact shade, transparent inside and outside the shape and independent of any backdrop. Over a backdrop it reads as `backdrop * (1 - shade) + light`, up to the cross term. A baked image gives up everything that depends on what is under the glass at the moment: the refraction follows the backdrop it was baked over, and the highlight is fixed (`configuration.staticLightDirection`) rather than swinging with the gyroscope. Main thread only.
+
+## Accessibility
+
+**Reduce Transparency** turns the glass into an opaque plate of one grey: dark in dark mode, light in light mode, with a hairline edge so the shape still reads. Nothing of the backdrop shows through, so neighbouring shapes are the same plate wherever they sit. It reacts as the setting changes. **Reduce Motion** disables the elastic deformation and makes `setShapes` jump. Increase Contrast is not handled.
 
 ## Knobs
 
@@ -153,6 +220,8 @@ Which is why there's no `.automatic` mode: it could only ever be a trap that pic
 
 **SDF cost** is 5 evaluations per pixel per shape, the gradient being central differences. Fine for UI-sized elements. Go analytic before covering a whole screen with a 12-shape group.
 
+**At most 12 shapes** per view (`LiquidGlassView.maxShapeCount`), trailing droplets included. Leaders come first, so a trail never displaces a real shape; extra shapes are not drawn.
+
 **No SwiftUI wrapper.** The explicit-backdrop model doesn't map onto SwiftUI without a container abstraction, and that's a design decision rather than a missing shim.
 
 ## Tests
@@ -163,9 +232,11 @@ xcodebuild -scheme LiquidGlass -destination 'platform=iOS Simulator,name=iPhone 
 
 They cover what you can't see by looking at the screen. With refraction, frost, tint, saturation and light all neutralized, the glass has to be a pixel-exact pass-through of the backdrop underneath it. Outside the rounded corner the fragment has to be fully transparent. A merge radius has to bridge a gap without moving the shapes. A pull has to stretch the shape and settle back, and a glyph has to ride the deformation.
 
+The newer behaviour is pinned the same way, as properties rather than as the code that makes them true. Two shapes with two tints must each show their own. With Reduce Transparency on, the plate over red and the plate over white must be the same grey, and dark mode and light mode must differ. A morph must start where the shapes are, land exactly on the target and leave no neck, no pulse and no recoil behind. A pill that goes into another must wait, shrink and be sucked into the partner's frame, one that comes out must start at once and be thrown past its place, and the partner must swell about the side it sits on even if it does not move. The engine must sleep when there is nothing to do and wake for every kind of change. A baked rim must be hollow inside and outside the shape and lit where the light is.
+
 The point is that a wrong uniform layout, a flipped UV or a bad coordinate conversion all still produce something glass-looking. These turn that into a red test.
 
-Two were checked by reverse run: swap two fields in `LGUniforms` and the pass-through test fails, remove the content transform and the glyph test fails.
+Each was checked by reverse run, breaking the thing it guards: swap two fields in `LGUniforms` and the pass-through test fails, remove the content transform and the glyph test fails, drop the engine's wake-up and the sleep test fails, give every shape the view's tint and the per-shape tint tests fail, let the Reduce Transparency plate follow the backdrop's brightness and its test fails, and remove the merge delay, the shrink or the recoil and the matching morph test fails.
 
 ## Sources
 

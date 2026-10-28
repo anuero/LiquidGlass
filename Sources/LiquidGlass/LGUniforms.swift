@@ -13,6 +13,7 @@ struct LGShape {
     var cornerExponent: Float = 4.2          // 2 = circular, ~4.2 = iOS continuous corners
     var _pad0: Float = 0
     var _pad1: Float = 0
+    var tint = SIMD4<Float>(0, 0, 0, 0)      // rgb + strength
 }
 
 struct LGUniforms {
@@ -42,6 +43,6 @@ struct LGUniforms {
 
     var mergeRadius: Float = 0
     var blurLOD: Float = 0
-    var _pad1: Float = 0
-    var _pad2: Float = 0
+    var solid: Float = 0                     // plate grey, 0 is off
+    var overlay: Float = 0                   // 1 is baked rim only
 }
